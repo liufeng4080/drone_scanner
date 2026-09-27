@@ -2,11 +2,8 @@
 #include "src/app_bsp/lvgl_bsp.h"
 #include "src/ui_src/generated/gui_guider.h"
 
-// ====== BLE 相关头文件 ======
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
 
 static lv_ui init_ui;
 DisplayPort RlcdPort(12, 11, 5, 40, 41, 400, 300);
@@ -21,30 +18,25 @@ static lv_obj_t * log_labels[MAX_LINES];
 static int log_write_index = 0;
 
 // ====== RID 数据结构 ======
-// 解析 GB 42590 / ASTM F3411 后的无人机信息
 struct RIDData {
-    char mac[18];           // 蓝牙 MAC 地址（用于关联同一设备的多条报文）
-    int rssi;               // 信号强度
-    uint8_t ua_type;        // 无人机类型（0-15）
-    uint8_t id_type;        // ID 类型
-    char uas_id[21];        // UAS ID（序列号/会话ID），最长 20 字符
-    double latitude;        // 纬度（度）
-    double longitude;       // 经度（度）
-    float altitude;         // 海拔高度（米）
-    float height;           // 相对起飞点高度（米）
-    float speed;            // 速度（m/s）
-    float heading;          // 航迹角（度）
-    uint8_t op_status;      // 运行状态
-    bool has_basic;         // 是否已解析到基本ID
-    bool has_location;      // 是否已解析到位置信息
+    char mac[18];
+    int rssi;
+    uint8_t ua_type;
+    uint8_t id_type;
+    char uas_id[21];
+    double latitude;
+    double longitude;
+    float altitude;
+    float height;
+    float speed;
+    float heading;
+    uint8_t op_status;
+    bool has_basic;
+    bool has_location;
 };
 
 // ====== FreeRTOS 通信 ======
 static QueueHandle_t rid_queue = NULL;
-
-// ====== BLE 扫描相关 ======
-BLEScan* pBLEScan = NULL;
-int scanTime = 3; // 扫描时间（秒）
 
 // ====== 前置声明 ======
 static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map);
@@ -63,116 +55,239 @@ static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t
     lv_display_flush_ready(drv);
 }
 
-// ====== GB 42590 / ASTM F3411 RID 解析 ======
-// 广播数据封装在 OUI (FA:0B:BC) + Vendor Type (0x0D) 之后
-// 每条报文 25 字节，报头高4位为类型，低4位固定为 0x1
-// 参考：民航局《民用微轻小型无人驾驶航空器运行识别最低性能要求》
-bool parse_gb42590_rid(uint8_t *payload, int len, RIDData *out) {
-    if (len < 5) return false;
+// ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
+// 注意：此函数运行在 Wi-Fi 驱动上下文中，必须用 xQueueSendFromISR
+// void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
+//     if (type != WIFI_PKT_MGMT) return;
 
-    // 检查 ASTM/国标 OUI (FA:0B:BC) 和 Vendor Type (0x0D)
-    if (payload[0] != 0xFA || payload[1] != 0x0B || payload[2] != 0xBC) return false;
-    if (payload[3] != 0x0D) return false;
+//     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buff;
+//     uint8_t *frame = pkt->payload;
+//     int len = pkt->rx_ctrl.sig_len;
 
-    // payload[4] 是 Message Counter，跳过
-    int offset = 5;
 
-    while (offset + 25 <= len) {
-        uint8_t *msg = payload + offset;
-        uint8_t msg_type = (msg[0] >> 4) & 0x0F;
-        uint8_t version = msg[0] & 0x0F;
+//     // 802.11 Beacon 帧最小长度检查
+//     // [0-1] Frame Control, [2-3] Duration, [4-9] DA, [10-15] SA, [16-21] BSSID,
+//     // [22-23] Seq, [24-31] Timestamp, [32-33] Beacon Interval, [34-35] Capability
+//     if (len < 36) return;
 
-        // 协议版本必须为 0x1
-        if (version != 0x1) {
-            offset += 25;
-            continue;
+
+//     // 只处理 Beacon 帧（Frame Control 的 subtype 为 0x8）
+//     uint8_t frame_type = (frame[0] >> 2) & 0x03;
+//     uint8_t frame_subtype = (frame[0] >> 4) & 0x0F;
+//     if (frame_type != 0x00 || frame_subtype != 0x08) return;
+
+
+//     int offset = 36;
+
+//     // 遍历所有 Information Elements
+//     while (offset + 2 <= len) {
+//         uint8_t ie_id = frame[offset];
+//         uint8_t ie_len = frame[offset + 1];
+
+//         if (offset + 2 + ie_len > len) break;
+
+
+//         // 查找 Vendor Specific IE (221 = 0xDD)
+//         if (ie_id == 0xDD && ie_len >= 7) {
+//             uint8_t *ie_data = frame + offset + 2;
+
+
+//             // 检查 OUI (FA:0B:BC) 和 OUI Type (0x0D)
+//             if (ie_data[0] == 0xFA && ie_data[1] == 0x0B &&
+//                 ie_data[2] == 0xBC && ie_data[3] == 0x0D) {
+//                 Serial.println("[SNIFFER] 6");
+
+//                 RIDData rid;
+//                 memset(&rid, 0, sizeof(rid));
+
+//                 // 提取源 MAC 地址
+//                 snprintf(rid.mac, sizeof(rid.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+//                          frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
+//                 rid.rssi = pkt->rx_ctrl.rssi;
+
+//                 // Message Pack 从 ie_data[5] 开始（ie_data[4] 是 Message Counter）
+//                 uint8_t *msg_pack = ie_data + 5;
+//                 int msg_len = ie_len - 5;
+
+//                 int msg_offset = 0;
+//                 while (msg_offset + 25 <= msg_len) {
+//                     uint8_t *msg = msg_pack + msg_offset;
+//                     uint8_t msg_type = (msg[0] >> 4) & 0x0F;
+//                     uint8_t version = msg[0] & 0x0F;
+//                     Serial.println("[SNIFFER] 7");
+
+//                     if (version == 0x1) {
+//                         if (msg_type == 0x0) {  // 基本 ID 报文
+//                             rid.id_type = (msg[1] >> 4) & 0x0F;
+//                             rid.ua_type = msg[1] & 0x0F;
+//                             memcpy(rid.uas_id, msg + 2, 20);
+//                             rid.uas_id[20] = '\0';
+//                             rid.has_basic = true;
+//                         }
+//                         else if (msg_type == 0x1) {  // 位置向量报文
+//                             rid.op_status = (msg[1] >> 4) & 0x0F;
+
+//                             int32_t lat, lon;
+//                             memcpy(&lat, msg + 5, 4);
+//                             memcpy(&lon, msg + 9, 4);
+//                             rid.latitude = lat * 1e-7;
+//                             rid.longitude = lon * 1e-7;
+
+//                             uint16_t alt;
+//                             memcpy(&alt, msg + 13, 2);
+//                             rid.altitude = (alt * 0.5f) - 1000.0f;
+
+//                             uint16_t spd;
+//                             memcpy(&spd, msg + 15, 2);
+//                             rid.speed = spd * 0.25f;
+
+//                             uint16_t hdg;
+//                             memcpy(&hdg, msg + 17, 2);
+//                             rid.heading = hdg * 0.01f;
+
+//                             rid.has_location = true;
+//                         }
+//                     }
+//                     msg_offset += 25;
+//                 }
+//                 Serial.println("[SNIFFER] 8");
+
+//                 // 入队（必须用 FromISR 版本）
+//                 if (rid_queue != NULL && (rid.has_basic || rid.has_location)) {
+//                     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+//                     Serial.println("[SNIFFER] 9");
+//                     xQueueSendFromISR(rid_queue, &rid, &xHigherPriorityTaskWoken);
+//                     if (xHigherPriorityTaskWoken) {
+//                         portYIELD_FROM_ISR();
+//                     }
+//                 }
+//             }
+//         }
+
+//         offset += 2 + ie_len;
+//     }
+// }
+// ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
+void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_MGMT) return;
+
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buff;
+    uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+
+    // 只处理 Beacon 帧（subtype = 0x08）
+    uint8_t subtype = (frame[0] >> 4) & 0x0F;
+    if (subtype != 0x08) return;
+    if (len < 36) return;
+
+    // 遍历 Information Elements
+    int offset = 36;
+    while (offset + 2 <= len) {
+        uint8_t ie_id = frame[offset];
+        uint8_t ie_len = frame[offset + 1];
+
+        if (offset + 2 + ie_len > len) break;
+
+        // 只关心 Vendor Specific IE (0xDD)
+        if (ie_id == 0xDD && ie_len >= 8) {
+            uint8_t *d = frame + offset + 2;
+
+            // 判断 OUI 是否为 FA:0B:BC，且 Type 为 0x0D
+            if (d[0] == 0xFA && d[1] == 0x0B && d[2] == 0xBC && d[3] == 0x0D) {
+
+                // 解析 RID 数据
+                RIDData rid;
+                memset(&rid, 0, sizeof(rid));
+
+                // 提取源 MAC 地址
+                snprintf(rid.mac, sizeof(rid.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
+                rid.rssi = pkt->rx_ctrl.rssi;
+
+                // 【关键修正】跳过 OUI(3) + Type(1) + MessageCounter(1) + PackHeader(3)
+                // d[0..2] = OUI, d[3] = Type, d[4] = MessageCounter
+                // d[5..7] = Pack Header (F1 xx xx)
+                // 真正的消息从 d[8] 开始
+                uint8_t *msg_pack = d + 8;
+                int msg_len = ie_len - 8;
+
+                int msg_offset = 0;
+                while (msg_offset + 25 <= msg_len) {
+                    uint8_t *msg = msg_pack + msg_offset;
+                    uint8_t msg_type = (msg[0] >> 4) & 0x0F;
+                    uint8_t version = msg[0] & 0x0F;
+
+                    if (version == 0x1) {
+                        if (msg_type == 0x0) {
+                            // 基本 ID 报文
+                            rid.id_type = (msg[1] >> 4) & 0x0F;
+                            rid.ua_type = msg[1] & 0x0F;
+                            memcpy(rid.uas_id, msg + 2, 20);
+                            rid.uas_id[20] = '\0';
+                            rid.has_basic = true;
+
+                            Serial.printf("[RID] BASIC ID: %s (id_type=%d ua_type=%d)\n",
+                                          rid.uas_id, rid.id_type, rid.ua_type);
+                        }
+                        else if (msg_type == 0x1) {
+                            // 位置向量报文
+                            rid.op_status = (msg[1] >> 4) & 0x0F;
+
+                            // 经纬度：int32 小端序，单位 1e-7 度
+                            int32_t lat, lon;
+                            memcpy(&lat, msg + 2, 4);
+                            memcpy(&lon, msg + 6, 4);
+                            rid.latitude = lat * 1e-7;
+                            rid.longitude = lon * 1e-7;
+
+                            // 高度：uint16 小端序，单位 0.5 米（偏移 -1000 米）
+                            uint16_t alt;
+                            memcpy(&alt, msg + 10, 2);
+                            rid.altitude = (alt * 0.5f) - 1000.0f;
+
+                            // 速度：uint16 小端序，单位 0.25 m/s
+                            uint16_t spd;
+                            memcpy(&spd, msg + 14, 2);
+                            rid.speed = spd * 0.25f;
+
+                            // 航迹角：uint16 小端序，单位 0.01 度
+                            uint16_t hdg;
+                            memcpy(&hdg, msg + 16, 2);
+                            rid.heading = hdg * 0.01f;
+
+                            rid.has_location = true;
+
+                            Serial.printf("[RID] LOCATION: %.4f, %.4f alt=%.1fm spd=%.1fm/s hdg=%.1f\n",
+                                          rid.latitude, rid.longitude,
+                                          rid.altitude, rid.speed, rid.heading);
+                        }
+                    }
+                    msg_offset += 25;
+                }
+
+                // 打印完整原始数据（调试用）
+                Serial.printf("[RID] MAC=%s RSSI=%d\n", rid.mac, rid.rssi);
+                Serial.print("[RID] Raw: ");
+                for (int i = 0; i < ie_len; i++) {
+                    Serial.printf("%02X ", d[i]);
+                }
+                Serial.println();
+
+                // 入队（必须用 FromISR 版本）
+                if (rid_queue != NULL && (rid.has_basic || rid.has_location)) {
+                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                    xQueueSendFromISR(rid_queue, &rid, &xHigherPriorityTaskWoken);
+                    if (xHigherPriorityTaskWoken) {
+                        portYIELD_FROM_ISR();
+                    }
+                }
+            }
         }
 
-        switch (msg_type) {
-            case 0x0:  // 基本 ID 报文
-                // msg[1]: 高4位 ID类型, 低4位 UA类型
-                out->id_type = (msg[1] >> 4) & 0x0F;
-                out->ua_type = msg[1] & 0x0F;
-                // UAS ID 从 msg[2] 开始，20 字节 ASCII
-                memcpy(out->uas_id, msg + 2, 20);
-                out->uas_id[20] = '\0';
-                out->has_basic = true;
-                break;
-
-            case 0x1:  // 位置向量报文
-                // msg[1]: 高4位运行状态, 低4位保留
-                out->op_status = (msg[1] >> 4) & 0x0F;
-
-                // 经度/纬度：int32 小端序，单位 1e-7 度
-                // 偏移量参考 ASTM F3411 报文格式
-                int32_t lat_raw, lon_raw;
-                memcpy(&lat_raw, msg + 5, 4);
-                memcpy(&lon_raw, msg + 9, 4);
-                out->latitude = lat_raw * 1e-7;
-                out->longitude = lon_raw * 1e-7;
-
-                // 高度：uint16 小端序，单位 0.5 米（偏移 500 米）
-                uint16_t alt_raw;
-                memcpy(&alt_raw, msg + 13, 2);
-                out->altitude = (alt_raw * 0.5f) - 1000.0f;
-
-                // 速度：uint16 小端序，单位 0.25 m/s
-                uint16_t spd_raw;
-                memcpy(&spd_raw, msg + 15, 2);
-                out->speed = spd_raw * 0.25f;
-
-                // 航迹角：uint16 小端序，单位 0.01 度
-                uint16_t hdg_raw;
-                memcpy(&hdg_raw, msg + 17, 2);
-                out->heading = hdg_raw * 0.01f;
-
-                out->has_location = true;
-                break;
-
-            case 0x4:  // 系统报文（操作员位置等）
-                // 可扩展解析操作员位置
-                break;
-
-            default:
-                break;
-        }
-        offset += 25;
+        offset += 2 + ie_len;
     }
-
-    return out->has_basic || out->has_location;
 }
 
-// ====== BLE 回调：解析 RID 数据并入队 ======
-class MyRIDCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
-        // 只处理有 manufacturer data 的设备
-        if (!advertisedDevice.haveManufacturerData()) return;
-
-        String mfgData = advertisedDevice.getManufacturerData();
-        int len = mfgData.length();
-        if (len < 5) return;
-
-        uint8_t *payload = (uint8_t *)mfgData.c_str();
-
-        RIDData rid;
-        memset(&rid, 0, sizeof(rid));
-
-        // 解析 GB 42590 格式
-        if (!parse_gb42590_rid(payload, len, &rid)) {
-            return;  // 不是 RID 广播，忽略
-        }
-
-        // 填充 MAC 和 RSSI
-        String addrStr = advertisedDevice.getAddress().toString();
-        strncpy(rid.mac, addrStr.c_str(), sizeof(rid.mac) - 1);
-        rid.rssi = advertisedDevice.getRSSI();
-
-        // 入队（非阻塞）
-        if (rid_queue != NULL) {
-            xQueueSend(rid_queue, &rid, 0);
-        }
-    }
-};
 
 // ====== LVGL 定时器：从队列取 RID 数据并更新界面 ======
 void update_rid_display(lv_timer_t * timer) {
@@ -183,47 +298,23 @@ void update_rid_display(lv_timer_t * timer) {
     RIDData rid;
     int processed = 0;
 
-    // 每次最多处理 3 条，避免单次 LVGL 任务负载过高
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
-        // 拼接显示字符串
-        // 格式：ID类型 UAS_ID 纬度 经度 RSSI
         char buffer[96];
         const char *id_str = (rid.uas_id[0] != '\0') ? rid.uas_id : rid.mac;
-        const char *ua_type_str = "";
-        switch (rid.ua_type) {
-            case 0: ua_type_str = "None"; break;
-            case 1: ua_type_str = "Aeroplane"; break;
-            case 2: ua_type_str = "Helicopter"; break;
-            case 3: ua_type_str = "Gyroplane"; break;
-            case 4: ua_type_str = "Hybrid"; break;
-            case 5: ua_type_str = "Ornithopter"; break;
-            case 6: ua_type_str = "Glider"; break;
-            case 7: ua_type_str = "Kite"; break;
-            case 8: ua_type_str = "FreeBalloon"; break;
-            case 9: ua_type_str = "CaptiveBalloon"; break;
-            case 10: ua_type_str = "Airship"; break;
-            case 11: ua_type_str = "FreeFall"; break;
-            case 12: ua_type_str = "Rocket"; break;
-            case 13: ua_type_str = "Tethered"; break;
-            case 14: ua_type_str = "Glider2"; break;
-            case 15: ua_type_str = "Other"; break;
-            default: ua_type_str = "?"; break;
-        }
 
         if (rid.has_location && rid.has_basic) {
-            snprintf(buffer, sizeof(buffer), "%.8s %s %.4f,%.4f %d",
-                     id_str, ua_type_str,
-                     rid.latitude, rid.longitude,
-                     rid.rssi);
+            snprintf(buffer, sizeof(buffer), "%.8s %.4f,%.4f %.0fm %d",
+                     id_str, rid.latitude, rid.longitude,
+                     rid.altitude, rid.rssi);
         } else if (rid.has_basic) {
-            snprintf(buffer, sizeof(buffer), "%.8s %s %d",
-                     id_str, ua_type_str, rid.rssi);
+            snprintf(buffer, sizeof(buffer), "%.8s ID %d",
+                     id_str, rid.rssi);
         } else {
-            snprintf(buffer, sizeof(buffer), "%s ? %d",
-                     rid.mac, rid.rssi);
+            snprintf(buffer, sizeof(buffer), "%s %.4f,%.4f %d",
+                     rid.mac, rid.latitude, rid.longitude, rid.rssi);
         }
 
-        // 去重：检查当前 10 个 Label 中是否已有相同内容
+        // 去重
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
             if (log_labels[i] == NULL) continue;
@@ -233,23 +324,19 @@ void update_rid_display(lv_timer_t * timer) {
                 break;
             }
         }
-        if (duplicate) {
-            continue;
-        }
+        if (duplicate) continue;
 
-        // 写入当前索引的 Label（环形覆盖）
         lv_label_set_text(log_labels[log_write_index], buffer);
         log_write_index = (log_write_index + 1) % MAX_LINES;
         processed++;
     }
 
-    // 有新数据时才滚动到底部
     if (processed > 0) {
         lv_obj_scroll_to_y(log_container, lv_obj_get_scroll_bottom(log_container), LV_ANIM_OFF);
     }
 }
 
-// ====== 日志列表初始化：一次性创建 10 个 Label ======
+// ====== 日志列表初始化 ======
 void log_init(void) {
     Serial.println("[INIT] log_init start");
 
@@ -291,7 +378,7 @@ void setup() {
     Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
     Serial.println("[SETUP] Lvgl_PortInit done");
 
-    // ===== 阶段 3：LVGL 对象创建（必须加锁）=====
+    // ===== 阶段 3：LVGL 对象创建（加锁）=====
     Serial.println("[SETUP] acquiring LVGL lock...");
     if (Lvgl_lock(-1)) {
         Serial.println("[SETUP] lock acquired, creating UI...");
@@ -313,33 +400,21 @@ void setup() {
         Serial.println("[SETUP] rid_queue created OK");
     }
 
-    // ===== 阶段 5：BLE 初始化 =====
-    Serial.println("[SETUP] initializing BLE...");
-    BLEDevice::init("");
-    Serial.println("[SETUP] BLEDevice::init done");
-
-    pBLEScan = BLEDevice::getScan();
-    Serial.println("[SETUP] getScan done");
-
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyRIDCallbacks());
-    Serial.println("[SETUP] setAdvertisedDeviceCallbacks done");
-
-    pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
-    Serial.println("[SETUP] scan config done");
+    // ===== 阶段 5：Wi-Fi 混杂模式 =====
+    Serial.println("[SETUP] starting Wi-Fi promiscuous mode...");
+    WiFi.mode(WIFI_MODE_STA);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
+    esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
 
     Serial.printf("[SETUP] Free heap: %d\n", esp_get_free_heap_size());
     Serial.println("===== SETUP DONE =====\n");
 }
 
 void loop() {
-    // 执行 BLE 扫描（阻塞 scanTime 秒）
-    BLEScanResults *foundDevices = pBLEScan->start(scanTime, false);
-    Serial.printf("[LOOP] scan done, found %d devices\n", foundDevices->getCount());
-
-    pBLEScan->clearResults(); // 释放扫描结果内存
-
-    // 短暂延时后再次扫描
-    delay(1000);
+    // 在 loop() 里轮流切换信道
+    static uint8_t ch = 1;
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    ch = (ch % 13) + 1;
+    delay(500);
 }
