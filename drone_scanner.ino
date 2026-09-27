@@ -1,8 +1,8 @@
 #include "display_bsp.h"
 #include "src/app_bsp/lvgl_bsp.h"
-
 #include "i2c_bsp.h"
 #include "codec_bsp.h"
+#include "sdcard_bsp.h"
 
 #include <WiFi.h>
 #include "esp_wifi.h"
@@ -13,6 +13,10 @@ DisplayPort RlcdPort(12, 11, 5, 40, 41, 400, 300);
 // ====== 音频（ES8311） ======
 I2cMasterBus I2cbus(14, 13, 0);
 CodecPort *codecport = NULL;
+
+// ====== SD 卡 ======
+CustomSDPort *sdcardPort = NULL;
+#define RID_LOG_FILE "/sdcard/rid_log.txt"
 
 // ====== 日志/列表显示相关 ======
 #define MAX_LINES 10
@@ -56,10 +60,9 @@ static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t
     lv_display_flush_ready(drv);
 }
 
-// ====== 蜂鸣：播放一声 1kHz、100ms 的 "嘟" ======
+// ====== 蜂鸣 ======
 void beep_once() {
     if (codecport == NULL) return;
-
     const int sample_rate = 16000;
     const int freq = 1000;
     const int duration_ms = 100;
@@ -71,7 +74,6 @@ void beep_once() {
     for (int i = 0; i < sample_count; i++) {
         buffer[i] = (int16_t)(sin(2 * PI * freq * i / sample_rate) * 10000);
     }
-
     codecport->CodecPort_PlayWrite(buffer, sample_count * sizeof(int16_t));
     free(buffer);
 }
@@ -99,7 +101,20 @@ const char* ua_type_to_string(uint8_t t) {
     }
 }
 
-// ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
+// ====== 同时输出到串口和 SD 卡（追加模式） ======
+void log_output(const char *msg) {
+    Serial.print(msg);
+    if (sdcardPort == NULL) return;
+
+    esp_err_t ret = sdcardPort->SDPort_AppendFile(RID_LOG_FILE,
+                                                   (char *)msg,
+                                                   strlen(msg));
+    if (ret != ESP_OK) {
+        Serial.println("[SD] append failed!");
+    }
+}
+
+// ====== Wi-Fi 混杂模式回调 ======
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
 
@@ -174,7 +189,6 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                     msg_offset += 25;
                 }
 
-                // ===== 每 10 秒最多打印一次 + 蜂鸣 =====
                 static uint32_t last_print_time = 0;
                 uint32_t now = millis();
                 bool should_print = (now - last_print_time >= 10000);
@@ -182,34 +196,37 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                 if ((rid.has_basic || rid.has_location) && should_print) {
                     last_print_time = now;
 
-                    // 蜂鸣
                     beep_once();
 
-                    Serial.println("========== RID ==========");
-                    Serial.printf("MAC       : %s\n", rid.mac);
-                    Serial.printf("RSSI      : %d dBm\n", rid.rssi);
+                    char out[512];
+                    int pos = 0;
+                    pos += snprintf(out + pos, sizeof(out) - pos, "========== RID ==========\n");
+                    pos += snprintf(out + pos, sizeof(out) - pos, "MAC       : %s\n", rid.mac);
+                    pos += snprintf(out + pos, sizeof(out) - pos, "RSSI      : %d dBm\n", rid.rssi);
                     if (rid.has_basic) {
-                        Serial.printf("UAS ID    : %s\n", rid.uas_id);
-                        Serial.printf("ID Type   : %d\n", rid.id_type);
-                        Serial.printf("UA Type   : %d (%s)\n", rid.ua_type, ua_type_to_string(rid.ua_type));
+                        pos += snprintf(out + pos, sizeof(out) - pos, "UAS ID    : %s\n", rid.uas_id);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "ID Type   : %d\n", rid.id_type);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "UA Type   : %d (%s)\n", rid.ua_type, ua_type_to_string(rid.ua_type));
                     }
                     if (rid.has_location) {
-                        Serial.printf("Latitude  : %.7f\n", rid.latitude);
-                        Serial.printf("Longitude : %.7f\n", rid.longitude);
-                        Serial.printf("Altitude  : %.1f m\n", rid.altitude);
-                        Serial.printf("Speed     : %.2f m/s\n", rid.speed);
-                        Serial.printf("Heading   : %.1f deg\n", rid.heading);
-                        Serial.printf("Status    : %d\n", rid.op_status);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Latitude  : %.7f\n", rid.latitude);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Longitude : %.7f\n", rid.longitude);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Altitude  : %.1f m\n", rid.altitude);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Speed     : %.2f m/s\n", rid.speed);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Heading   : %.1f deg\n", rid.heading);
+                        pos += snprintf(out + pos, sizeof(out) - pos, "Status    : %d\n", rid.op_status);
                     }
+                    pos += snprintf(out + pos, sizeof(out) - pos, "RAW Len   : %d\n", ie_len);
+                    pos += snprintf(out + pos, sizeof(out) - pos, "RAW Data  : ");
+                    for (int i = 0; i < ie_len && pos < (int)sizeof(out) - 4; i++) {
+                        pos += snprintf(out + pos, sizeof(out) - pos, "%02X ", d[i]);
+                        if ((i + 1) % 16 == 0 && pos < (int)sizeof(out) - 2) {
+                            pos += snprintf(out + pos, sizeof(out) - pos, "\n            ");
+                        }
+                    }
+                    pos += snprintf(out + pos, sizeof(out) - pos, "\n==========================\n");
 
-                    Serial.printf("RAW Len   : %d\n", ie_len);
-                    Serial.print("RAW Data  : ");
-                    for (int i = 0; i < ie_len; i++) {
-                        Serial.printf("%02X ", d[i]);
-                        if ((i + 1) % 16 == 0) Serial.print("\n            ");
-                    }
-                    Serial.println();
-                    Serial.println("==========================");
+                    log_output(out);
                 }
 
                 if (rid_queue != NULL && (rid.has_basic || rid.has_location)) {
@@ -283,15 +300,23 @@ void setup() {
     delay(500);
     Serial.println("\n===== BOOT =====");
 
-    // 1. 音频（ES8311）
+    // 1. SD 卡
+    sdcardPort = new CustomSDPort("/sdcard");
+    if (sdcardPort != NULL) {
+        Serial.println("SD card init OK");
+    } else {
+        Serial.println("SD card init FAILED");
+    }
+
+    // 2. 音频（ES8311）
     codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
     codecport->CodecPort_SetInfo("es8311", 1, 16000, 1, 16);
     codecport->CodecPort_SetSpeakerVol(80);
 
-    // 2. RLCD
+    // 3. RLCD
     RlcdPort.RLCD_Init();
 
-    // 3. LVGL
+    // 4. LVGL
     Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
     if (Lvgl_lock(-1)) {
         lv_tick_set_cb(millis);
@@ -300,10 +325,10 @@ void setup() {
         Lvgl_unlock();
     }
 
-    // 4. RID 队列
+    // 5. RID 队列
     rid_queue = xQueueCreate(20, sizeof(RIDData));
 
-    // 5. Wi-Fi 混杂模式
+    // 6. Wi-Fi 混杂模式
     WiFi.mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
