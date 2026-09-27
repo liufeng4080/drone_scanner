@@ -22,6 +22,9 @@ CustomSDPort *sdcardPort = NULL;
 // ====== 电池电压 ======
 static lv_obj_t * bat_label = NULL;
 
+// ====== 启动画面 ======
+static lv_obj_t * splash_label = NULL;
+
 // ====== 日志/列表显示相关 ======
 #define MAX_LINES 10
 static lv_obj_t * log_container = NULL;
@@ -134,6 +137,14 @@ void bat_update_timer(lv_timer_t * timer) {
     char buf[24];
     snprintf(buf, sizeof(buf), "BAT: %.2fV", vol);
     lv_label_set_text(bat_label, buf);
+}
+
+// ====== 启动画面 ======
+void splash_init(void) {
+    splash_label = lv_label_create(lv_scr_act());
+    lv_obj_set_style_text_font(splash_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(splash_label, "DRONE SCANNER");
+    lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
 }
 
 // ====== Wi-Fi 混杂模式回调 ======
@@ -275,6 +286,12 @@ void update_rid_display(lv_timer_t * timer) {
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
         if (!rid.has_basic || rid.uas_id[0] == '\0') continue;
 
+        // 收到第一条有效 RID，移除启动画面
+        if (splash_label != NULL) {
+            lv_obj_del(splash_label);
+            splash_label = NULL;
+        }
+
         const char *display_str = rid.uas_id;
 
         bool duplicate = false;
@@ -347,6 +364,7 @@ void setup() {
         lv_tick_set_cb(millis);
         log_init();
         bat_label_init();
+        splash_init();
         lv_timer_create(update_rid_display, 500, NULL);
         lv_timer_create(bat_update_timer, 1000, NULL);
         Lvgl_unlock();
