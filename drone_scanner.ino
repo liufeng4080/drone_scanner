@@ -31,12 +31,14 @@ static lv_obj_t * log_container = NULL;
 static lv_obj_t * log_labels[MAX_LINES];
 static int log_write_index = 0;
 
-// ====== 右侧：最新无人机详情 ======
+// ====== 右侧：最新无人机详情（14 行） ======
+#define DETAIL_LINES 14
 static lv_obj_t * detail_container = NULL;
-static lv_obj_t * detail_labels[10];
-static const char *detail_titles[10] = {
-    "ID:", "MAC:", "RSSI:", "UA Type:", "ID Type:",
-    "Lat:", "Lon:", "Alt:", "Spd:", "Stat:"
+static lv_obj_t * detail_labels[DETAIL_LINES];
+static const char *detail_titles[DETAIL_LINES] = {
+    "ID:", "MAC:", "RSSI:", "UA:", "IDT:", "MsgCnt:",
+    "Cord:", "Spd/VSpd:", "Hdg:", "HRef:", "Acc(H/V/S):",
+    "Time:", "OpCord:", "OpID:"
 };
 
 // ====== RID 数据结构 ======
@@ -46,14 +48,38 @@ struct RIDData {
     uint8_t ua_type;
     uint8_t id_type;
     char uas_id[21];
+    uint8_t msg_counter;
+    uint8_t pack_count;
+
     double latitude;
     double longitude;
     float altitude;
     float speed;
     float heading;
+    float speed_vertical;
+    uint8_t height_ref;
+    uint8_t horiz_acc;
+    uint8_t vert_acc;
+    uint8_t speed_acc;
+    uint16_t timestamp;
+
+    double op_latitude;
+    double op_longitude;
+    float op_altitude;
+    uint8_t op_loc_type;
+    uint16_t area_radius;
+    float area_ceiling;
+    float area_floor;
+
+    char self_id[24];
+    char operator_id[24];
+
     uint8_t op_status;
     bool has_basic;
     bool has_location;
+    bool has_system;
+    bool has_self_id;
+    bool has_operator_id;
 };
 
 static QueueHandle_t rid_queue = NULL;
@@ -98,7 +124,7 @@ const char* ua_type_to_string(uint8_t t) {
     switch (t) {
         case 0: return "None";
         case 1: return "Aeroplane";
-        case 2: return "Helicopter/Multirotor";
+        case 2: return "Heli/Multirotor";
         case 3: return "Gyroplane";
         case 4: return "Hybrid";
         case 5: return "Ornithopter";
@@ -133,7 +159,7 @@ void log_output(const char *msg) {
 void bat_label_init(void) {
     bat_label = lv_label_create(lv_scr_act());
     lv_obj_set_style_text_font(bat_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(bat_label, LV_ALIGN_TOP_RIGHT, -5, 5);
+    lv_obj_align(bat_label, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
     lv_label_set_text(bat_label, "BAT: --.--V");
 }
 
@@ -160,7 +186,7 @@ void splash_init(void) {
     lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
 }
 
-// ====== 左侧列表初始化（保持原字体和间距） ======
+// ====== 左侧列表初始化 ======
 void log_init(void) {
     log_container = lv_obj_create(lv_scr_act());
     if (log_container == NULL) return;
@@ -178,19 +204,19 @@ void log_init(void) {
     log_write_index = 0;
 }
 
-// ====== 右侧详情初始化（小字号 + 压缩行间距） ======
+// ====== 右侧详情初始化 ======
 void detail_init(void) {
     detail_container = lv_obj_create(lv_scr_act());
     if (detail_container == NULL) return;
-    lv_obj_set_size(detail_container, 200, 270);
-    lv_obj_align(detail_container, LV_ALIGN_TOP_RIGHT, 0, 20);
+    lv_obj_set_size(detail_container, 200, 280);
+    lv_obj_align(detail_container, LV_ALIGN_TOP_RIGHT, 0, 10);
     lv_obj_set_flex_flow(detail_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollbar_mode(detail_container, LV_SCROLLBAR_MODE_AUTO);
 
     lv_obj_set_style_pad_row(detail_container, 2, 0);
-    lv_obj_set_style_pad_all(detail_container, 4, 0);
+    lv_obj_set_style_pad_all(detail_container, 3, 0);
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < DETAIL_LINES; i++) {
         detail_labels[i] = lv_label_create(detail_container);
         lv_obj_set_width(detail_labels[i], 190);
         lv_label_set_long_mode(detail_labels[i], LV_LABEL_LONG_WRAP);
@@ -202,15 +228,13 @@ void detail_init(void) {
         lv_label_set_text(detail_labels[i], buf);
     }
 
-    // 启动时隐藏右侧详情，避免遮挡 splash
     lv_obj_add_flag(detail_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ====== 更新右侧详情 ======
 void detail_update(RIDData *rid) {
     if (detail_container == NULL) return;
-
-    char buf[64];
+    char buf[96];
 
     snprintf(buf, sizeof(buf), "ID: %s", rid->uas_id[0] ? rid->uas_id : "--");
     lv_label_set_text(detail_labels[0], buf);
@@ -221,26 +245,47 @@ void detail_update(RIDData *rid) {
     snprintf(buf, sizeof(buf), "RSSI: %d dBm", rid->rssi);
     lv_label_set_text(detail_labels[2], buf);
 
-    snprintf(buf, sizeof(buf), "UA Type: %s", ua_type_to_string(rid->ua_type));
+    snprintf(buf, sizeof(buf), "UA: %s", ua_type_to_string(rid->ua_type));
     lv_label_set_text(detail_labels[3], buf);
 
-    snprintf(buf, sizeof(buf), "ID Type: %d", rid->id_type);
+    snprintf(buf, sizeof(buf), "IDT: %d", rid->id_type);
     lv_label_set_text(detail_labels[4], buf);
 
-    snprintf(buf, sizeof(buf), "Lat: %.5f", rid->latitude);
+    snprintf(buf, sizeof(buf), "MsgCnt: %d", rid->msg_counter);
     lv_label_set_text(detail_labels[5], buf);
 
-    snprintf(buf, sizeof(buf), "Lon: %.5f", rid->longitude);
+    // 纬度 / 经度 / 高度
+    snprintf(buf, sizeof(buf), "Cord: %.4f/%.4f/%.0fm",
+             rid->latitude, rid->longitude, rid->altitude);
     lv_label_set_text(detail_labels[6], buf);
 
-    snprintf(buf, sizeof(buf), "Alt: %.1f m", rid->altitude);
+    // 水平速度 / 垂直速度
+    snprintf(buf, sizeof(buf), "Spd/VSpd: %.2f/%.1f",
+             rid->speed, rid->speed_vertical);
     lv_label_set_text(detail_labels[7], buf);
 
-    snprintf(buf, sizeof(buf), "Spd: %.2f m/s", rid->speed);
+    // 航向角
+    snprintf(buf, sizeof(buf), "Hdg: %.1f deg", rid->heading);
     lv_label_set_text(detail_labels[8], buf);
 
-    snprintf(buf, sizeof(buf), "Stat: %d", rid->op_status);
+    snprintf(buf, sizeof(buf), "HRef: %d", rid->height_ref);
     lv_label_set_text(detail_labels[9], buf);
+
+    // 水平 / 垂直 / 速度精度
+    snprintf(buf, sizeof(buf), "Acc(H/V/S): %d/%d/%d",
+             rid->horiz_acc, rid->vert_acc, rid->speed_acc);
+    lv_label_set_text(detail_labels[10], buf);
+
+    snprintf(buf, sizeof(buf), "Time: %u", rid->timestamp);
+    lv_label_set_text(detail_labels[11], buf);
+
+    // 操作员纬度 / 经度 / 高度
+    snprintf(buf, sizeof(buf), "OpCord: %.4f/%.4f/%.0fm",
+             rid->op_latitude, rid->op_longitude, rid->op_altitude);
+    lv_label_set_text(detail_labels[12], buf);
+
+    snprintf(buf, sizeof(buf), "OpID: %s", rid->operator_id[0] ? rid->operator_id : "--");
+    lv_label_set_text(detail_labels[13], buf);
 }
 
 // ====== Wi-Fi 混杂模式回调 ======
@@ -273,6 +318,8 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                 snprintf(rid.mac, sizeof(rid.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                          frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
                 rid.rssi = pkt->rx_ctrl.rssi;
+                rid.msg_counter = d[4];
+                rid.pack_count = d[7];
 
                 uint8_t *msg_pack = d + 8;
                 int msg_len = ie_len - 8;
@@ -312,7 +359,47 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                             memcpy(&hdg, msg + 17, 2);
                             rid.heading = hdg * 0.01f;
 
+                            rid.speed_vertical = (int8_t)msg[16] * 0.5f;
+                            rid.height_ref = (msg[17] >> 4) & 0x0F;
+                            rid.horiz_acc = msg[18] & 0x0F;
+                            rid.vert_acc = msg[19] & 0x0F;
+                            rid.speed_acc = msg[20] & 0x0F;
+                            memcpy(&rid.timestamp, msg + 21, 2);
+
                             rid.has_location = true;
+                        }
+                        else if (msg_type == 0x3) {
+                            memcpy(rid.self_id, msg + 2, 23);
+                            rid.self_id[23] = '\0';
+                            rid.has_self_id = true;
+                        }
+                        else if (msg_type == 0x4) {
+                            rid.op_loc_type = (msg[1] >> 4) & 0x0F;
+
+                            int32_t op_lat, op_lon;
+                            memcpy(&op_lat, msg + 2, 4);
+                            memcpy(&op_lon, msg + 6, 4);
+                            rid.op_latitude = op_lat * 1e-7;
+                            rid.op_longitude = op_lon * 1e-7;
+
+                            uint16_t op_alt;
+                            memcpy(&op_alt, msg + 10, 2);
+                            rid.op_altitude = (op_alt * 0.5f) - 1000.0f;
+
+                            memcpy(&rid.area_radius, msg + 14, 2);
+
+                            uint16_t ceiling, floor;
+                            memcpy(&ceiling, msg + 16, 2);
+                            memcpy(&floor, msg + 18, 2);
+                            rid.area_ceiling = ceiling * 0.5f;
+                            rid.area_floor = floor * 0.5f;
+
+                            rid.has_system = true;
+                        }
+                        else if (msg_type == 0x5) {
+                            memcpy(rid.operator_id, msg + 2, 20);
+                            rid.operator_id[20] = '\0';
+                            rid.has_operator_id = true;
                         }
                     }
                     msg_offset += 25;
@@ -382,7 +469,6 @@ void update_rid_display(lv_timer_t * timer) {
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
         if (!rid.has_basic || rid.uas_id[0] == '\0') continue;
 
-        // 收到第一条有效 RID，移除启动画面，显示右侧详情
         if (splash_label != NULL) {
             lv_obj_del(splash_label);
             splash_label = NULL;
@@ -392,10 +478,8 @@ void update_rid_display(lv_timer_t * timer) {
             }
         }
 
-        // 更新右侧详情（始终显示最新一条）
         detail_update(&rid);
 
-        // 左侧列表去重
         const char *display_str = rid.uas_id;
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
@@ -427,26 +511,15 @@ void setup() {
     Serial.println("\n===== BOOT =====");
     Serial.printf("CPU freq: %d MHz\n", getCpuFrequencyMhz());
 
-    // 1. SD 卡
     sdcardPort = new CustomSDPort("/sdcard");
-    if (sdcardPort != NULL) {
-        Serial.println("SD card init OK");
-    } else {
-        Serial.println("SD card init FAILED");
-    }
 
-    // 2. 音频（ES8311）
     codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
     codecport->CodecPort_SetInfo("es8311", 1, 16000, 1, 16);
     codecport->CodecPort_SetSpeakerVol(80);
 
-    // 3. RLCD
     RlcdPort.RLCD_Init();
-
-    // 4. ADC（电池电压）
     Adc_PortInit();
 
-    // 5. LVGL
     Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
     if (Lvgl_lock(-1)) {
         lv_tick_set_cb(millis);
@@ -459,10 +532,8 @@ void setup() {
         Lvgl_unlock();
     }
 
-    // 6. RID 队列
     rid_queue = xQueueCreate(20, sizeof(RIDData));
 
-    // 7. Wi-Fi 混杂模式
     WiFi.mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
