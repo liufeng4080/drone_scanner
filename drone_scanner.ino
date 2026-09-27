@@ -3,6 +3,7 @@
 #include "i2c_bsp.h"
 #include "codec_bsp.h"
 #include "sdcard_bsp.h"
+#include "adc_bsp.h"
 
 #include <WiFi.h>
 #include "esp_wifi.h"
@@ -17,6 +18,9 @@ CodecPort *codecport = NULL;
 // ====== SD 卡 ======
 CustomSDPort *sdcardPort = NULL;
 #define RID_LOG_FILE "/sdcard/rid_log.txt"
+
+// ====== 电池电压 ======
+static lv_obj_t * bat_label = NULL;
 
 // ====== 日志/列表显示相关 ======
 #define MAX_LINES 10
@@ -112,6 +116,24 @@ void log_output(const char *msg) {
     if (ret != ESP_OK) {
         Serial.println("[SD] append failed!");
     }
+}
+
+// ====== 电池电压显示初始化 ======
+void bat_label_init(void) {
+    bat_label = lv_label_create(lv_scr_act());
+    lv_obj_set_style_text_font(bat_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(bat_label, LV_ALIGN_TOP_RIGHT, -5, 5);
+    lv_label_set_text(bat_label, "BAT: --.--V");
+}
+
+// ====== 电池电压刷新定时器 ======
+void bat_update_timer(lv_timer_t * timer) {
+    if (bat_label == NULL) return;
+    int data;
+    float vol = Adc_GetBatteryVoltage(&data);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "BAT: %.2fV", vol);
+    lv_label_set_text(bat_label, buf);
 }
 
 // ====== Wi-Fi 混杂模式回调 ======
@@ -316,19 +338,24 @@ void setup() {
     // 3. RLCD
     RlcdPort.RLCD_Init();
 
-    // 4. LVGL
+    // 4. ADC（电池电压）
+    Adc_PortInit();
+
+    // 5. LVGL
     Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
     if (Lvgl_lock(-1)) {
         lv_tick_set_cb(millis);
         log_init();
+        bat_label_init();
         lv_timer_create(update_rid_display, 500, NULL);
+        lv_timer_create(bat_update_timer, 1000, NULL);
         Lvgl_unlock();
     }
 
-    // 5. RID 队列
+    // 6. RID 队列
     rid_queue = xQueueCreate(20, sizeof(RIDData));
 
-    // 6. Wi-Fi 混杂模式
+    // 7. Wi-Fi 混杂模式
     WiFi.mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
