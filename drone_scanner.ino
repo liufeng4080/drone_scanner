@@ -1,15 +1,19 @@
 #include "display_bsp.h"
 #include "src/app_bsp/lvgl_bsp.h"
 #include "src/ui_src/generated/gui_guider.h"
+#include "i2c_bsp.h"
+#include "codec_bsp.h"
 
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include <math.h>
 
 static lv_ui init_ui;
 DisplayPort RlcdPort(12, 11, 5, 40, 41, 400, 300);
 
-#define SCREEN_WIDTH  400
-#define SCREEN_HEIGHT 300
+// ====== 音频（ES8311） ======
+I2cMasterBus I2cbus(14, 13, 0);
+CodecPort *codecport = NULL;
 
 // ====== 日志/列表显示相关 ======
 #define MAX_LINES 10
@@ -27,7 +31,6 @@ struct RIDData {
     double latitude;
     double longitude;
     float altitude;
-    float height;
     float speed;
     float heading;
     uint8_t op_status;
@@ -35,7 +38,6 @@ struct RIDData {
     bool has_location;
 };
 
-// ====== FreeRTOS 通信 ======
 static QueueHandle_t rid_queue = NULL;
 
 // ====== 前置声明 ======
@@ -53,6 +55,26 @@ static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t
     }
     RlcdPort.RLCD_Display();
     lv_display_flush_ready(drv);
+}
+
+// ====== 蜂鸣：播放一声 1kHz、100ms 的 "嘟" ======
+void beep_once() {
+    if (codecport == NULL) return;
+
+    const int sample_rate = 16000;
+    const int freq = 1000;
+    const int duration_ms = 100;
+    const int sample_count = sample_rate * duration_ms / 1000;
+
+    int16_t *buffer = (int16_t *)malloc(sample_count * sizeof(int16_t));
+    if (buffer == NULL) return;
+
+    for (int i = 0; i < sample_count; i++) {
+        buffer[i] = (int16_t)(sin(2 * PI * freq * i / sample_rate) * 10000);
+    }
+
+    codecport->CodecPort_PlayWrite(buffer, sample_count * sizeof(int16_t));
+    free(buffer);
 }
 
 // ====== UA 类型转字符串 ======
@@ -79,7 +101,6 @@ const char* ua_type_to_string(uint8_t t) {
 }
 
 // ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
-// ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
 
@@ -87,12 +108,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     uint8_t *frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
 
-    // 只处理 Beacon 帧（subtype = 0x08）
     uint8_t subtype = (frame[0] >> 4) & 0x0F;
     if (subtype != 0x08) return;
     if (len < 36) return;
 
-    // 遍历 Information Elements
     int offset = 36;
     while (offset + 2 <= len) {
         uint8_t ie_id = frame[offset];
@@ -100,22 +119,18 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 
         if (offset + 2 + ie_len > len) break;
 
-        // 只关心 Vendor Specific IE (0xDD)
         if (ie_id == 0xDD && ie_len >= 8) {
             uint8_t *d = frame + offset + 2;
 
-            // 判断 OUI 是否为 FA:0B:BC，且 Type 为 0x0D
             if (d[0] == 0xFA && d[1] == 0x0B && d[2] == 0xBC && d[3] == 0x0D) {
 
                 RIDData rid;
                 memset(&rid, 0, sizeof(rid));
 
-                // 提取源 MAC 地址
                 snprintf(rid.mac, sizeof(rid.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                          frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
                 rid.rssi = pkt->rx_ctrl.rssi;
 
-                // 跳过 OUI(3) + Type(1) + MessageCounter(1) + PackHeader(3)
                 uint8_t *msg_pack = d + 8;
                 int msg_len = ie_len - 8;
 
@@ -160,13 +175,16 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                     msg_offset += 25;
                 }
 
-                // ===== 每 10 秒最多打印一次 =====
+                // ===== 每 10 秒最多打印一次 + 蜂鸣 =====
                 static uint32_t last_print_time = 0;
                 uint32_t now = millis();
                 bool should_print = (now - last_print_time >= 10000);
 
                 if ((rid.has_basic || rid.has_location) && should_print) {
                     last_print_time = now;
+
+                    // 蜂鸣
+                    beep_once();
 
                     Serial.println("========== RID ==========");
                     Serial.printf("MAC       : %s\n", rid.mac);
@@ -189,15 +207,12 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
                     Serial.print("RAW Data  : ");
                     for (int i = 0; i < ie_len; i++) {
                         Serial.printf("%02X ", d[i]);
-                        if ((i + 1) % 16 == 0) {
-                            Serial.print("\n            ");
-                        }
+                        if ((i + 1) % 16 == 0) Serial.print("\n            ");
                     }
                     Serial.println();
                     Serial.println("==========================");
                 }
 
-                // 入队（显示逻辑不受打印频率影响）
                 if (rid_queue != NULL && (rid.has_basic || rid.has_location)) {
                     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
                     xQueueSendFromISR(rid_queue, &rid, &xHigherPriorityTaskWoken);
@@ -214,22 +229,16 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 
 // ====== LVGL 定时器：只显示 UAS ID ======
 void update_rid_display(lv_timer_t * timer) {
-    if (rid_queue == NULL || log_container == NULL) {
-        return;
-    }
+    if (rid_queue == NULL || log_container == NULL) return;
 
     RIDData rid;
     int processed = 0;
 
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
-        // 只显示 UAS ID，不截断
-        if (!rid.has_basic || rid.uas_id[0] == '\0') {
-            continue;
-        }
+        if (!rid.has_basic || rid.uas_id[0] == '\0') continue;
 
         const char *display_str = rid.uas_id;
 
-        // 去重
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
             if (log_labels[i] == NULL) continue;
@@ -253,13 +262,8 @@ void update_rid_display(lv_timer_t * timer) {
 
 // ====== 日志列表初始化 ======
 void log_init(void) {
-    Serial.println("[INIT] log_init start");
-
     log_container = lv_obj_create(lv_scr_act());
-    if (log_container == NULL) {
-        Serial.println("[INIT] ERROR: log_container creation failed!");
-        return;
-    }
+    if (log_container == NULL) return;
     lv_obj_set_size(log_container, 390, 290);
     lv_obj_align(log_container, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_flex_flow(log_container, LV_FLEX_FLOW_COLUMN);
@@ -267,67 +271,46 @@ void log_init(void) {
 
     for (int i = 0; i < MAX_LINES; i++) {
         log_labels[i] = lv_label_create(log_container);
-        if (log_labels[i] == NULL) {
-            Serial.printf("[INIT] ERROR: log_labels[%d] creation failed!\n", i);
-            return;
-        }
-        // 设置 Label 宽度，确保长文本不被截断
         lv_obj_set_width(log_labels[i], 380);
         lv_label_set_long_mode(log_labels[i], LV_LABEL_LONG_WRAP);
         lv_label_set_text(log_labels[i], "");
     }
     log_write_index = 0;
-    Serial.println("[INIT] log_init done");
 }
 
 // ====== 初始化 ======
 void setup() {
     Serial.begin(115200);
     delay(500);
-  
     Serial.println("\n===== BOOT =====");
 
-    // ===== 阶段 1：RLCD 硬件初始化 =====
-    Serial.println("[SETUP] RLCD_Init...");
+    // 1. 音频（ES8311）
+    codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
+    codecport->CodecPort_SetInfo("es8311", 1, 16000, 1, 16);
+    codecport->CodecPort_SetSpeakerVol(80);
+
+    // 2. RLCD
     RlcdPort.RLCD_Init();
-    Serial.println("[SETUP] RLCD_Init done");
 
-    // ===== 阶段 2：LVGL 初始化 =====
-    Serial.println("[SETUP] Lvgl_PortInit...");
+    // 3. LVGL
     Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
-    Serial.println("[SETUP] Lvgl_PortInit done");
-
-    // ===== 阶段 3：LVGL 对象创建（加锁）=====
-    Serial.println("[SETUP] acquiring LVGL lock...");
     if (Lvgl_lock(-1)) {
-        Serial.println("[SETUP] lock acquired, creating UI...");
         lv_tick_set_cb(millis);
         log_init();
         lv_timer_create(update_rid_display, 500, NULL);
         Lvgl_unlock();
-        Serial.println("[SETUP] UI created, lock released");
-    } else {
-        Serial.println("[SETUP] ERROR: failed to acquire LVGL lock!");
     }
 
-    // ===== 阶段 4：创建 RID 队列 =====
-    Serial.println("[SETUP] creating rid_queue...");
+    // 4. RID 队列
     rid_queue = xQueueCreate(20, sizeof(RIDData));
-    if (rid_queue == NULL) {
-        Serial.println("[SETUP] ERROR: Failed to create rid_queue!");
-    } else {
-        Serial.println("[SETUP] rid_queue created OK");
-    }
 
-    // ===== 阶段 5：Wi-Fi 混杂模式 =====
-    Serial.println("[SETUP] starting Wi-Fi promiscuous mode...");
+    // 5. Wi-Fi 混杂模式
     WiFi.mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_packet_handler);
     esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
 
-    Serial.printf("[SETUP] Free heap: %d\n", esp_get_free_heap_size());
-    Serial.println("===== SETUP DONE =====\n");
+    Serial.println("Setup done");
 }
 
 void loop() {
