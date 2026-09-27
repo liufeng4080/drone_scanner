@@ -129,11 +129,17 @@ void bat_label_init(void) {
     lv_label_set_text(bat_label, "BAT: --.--V");
 }
 
-// ====== 电池电压刷新定时器 ======
+// ====== 电池电压刷新定时器（30 秒一次） ======
 void bat_update_timer(lv_timer_t * timer) {
     if (bat_label == NULL) return;
     int data;
     float vol = Adc_GetBatteryVoltage(&data);
+
+    // 变化小于 0.05V 时不刷新，避免无意义重绘
+    static float last_vol = 0;
+    if (fabs(vol - last_vol) < 0.05f) return;
+    last_vol = vol;
+
     char buf[24];
     snprintf(buf, sizeof(buf), "BAT: %.2fV", vol);
     lv_label_set_text(bat_label, buf);
@@ -276,7 +282,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// ====== LVGL 定时器：只显示 UAS ID ======
+// ====== LVGL 定时器：只显示 UAS ID（3 秒一次） ======
 void update_rid_display(lv_timer_t * timer) {
     if (rid_queue == NULL || log_container == NULL) return;
 
@@ -335,9 +341,13 @@ void log_init(void) {
 
 // ====== 初始化 ======
 void setup() {
+    // 降低 CPU 主频到 80MHz
+    setCpuFrequencyMhz(80);
+
     Serial.begin(115200);
     delay(500);
     Serial.println("\n===== BOOT =====");
+    Serial.printf("CPU freq: %d MHz\n", getCpuFrequencyMhz());
 
     // 1. SD 卡
     sdcardPort = new CustomSDPort("/sdcard");
@@ -365,8 +375,10 @@ void setup() {
         log_init();
         bat_label_init();
         splash_init();
-        lv_timer_create(update_rid_display, 500, NULL);
-        lv_timer_create(bat_update_timer, 1000, NULL);
+        // LVGL 刷新周期改为 3 秒
+        lv_timer_create(update_rid_display, 3000, NULL);
+        // 电池电压刷新周期改为 30 秒
+        lv_timer_create(bat_update_timer, 30000, NULL);
         Lvgl_unlock();
     }
 
