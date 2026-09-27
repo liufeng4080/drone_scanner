@@ -21,8 +21,18 @@ static int log_write_index = 0;
 struct RIDData {
     char mac[18];
     int rssi;
-    char uas_id[21];        // UAS ID，最长 20 字符
+    uint8_t ua_type;
+    uint8_t id_type;
+    char uas_id[21];
+    double latitude;
+    double longitude;
+    float altitude;
+    float height;
+    float speed;
+    float heading;
+    uint8_t op_status;
     bool has_basic;
+    bool has_location;
 };
 
 // ====== FreeRTOS 通信 ======
@@ -45,6 +55,30 @@ static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t
     lv_display_flush_ready(drv);
 }
 
+// ====== UA 类型转字符串 ======
+const char* ua_type_to_string(uint8_t t) {
+    switch (t) {
+        case 0: return "None";
+        case 1: return "Aeroplane";
+        case 2: return "Helicopter/Multirotor";
+        case 3: return "Gyroplane";
+        case 4: return "Hybrid";
+        case 5: return "Ornithopter";
+        case 6: return "Glider";
+        case 7: return "Kite";
+        case 8: return "FreeBalloon";
+        case 9: return "CaptiveBalloon";
+        case 10: return "Airship";
+        case 11: return "FreeFall";
+        case 12: return "Rocket";
+        case 13: return "Tethered";
+        case 14: return "Glider2";
+        case 15: return "Other";
+        default: return "Unknown";
+    }
+}
+
+// ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
 // ====== Wi-Fi 混杂模式回调：解析 GB 42590 RID ======
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
@@ -93,17 +127,78 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
 
                     if (version == 0x1) {
                         if (msg_type == 0x0) {
-                            // 基本 ID 报文：UAS ID 从 msg[2] 开始，20 字节 ASCII
+                            rid.id_type = (msg[1] >> 4) & 0x0F;
+                            rid.ua_type = msg[1] & 0x0F;
                             memcpy(rid.uas_id, msg + 2, 20);
                             rid.uas_id[20] = '\0';
                             rid.has_basic = true;
+                        }
+                        else if (msg_type == 0x1) {
+                            rid.op_status = (msg[1] >> 4) & 0x0F;
+
+                            int32_t lat, lon;
+                            memcpy(&lat, msg + 5, 4);
+                            memcpy(&lon, msg + 9, 4);
+                            rid.latitude = lat * 1e-7;
+                            rid.longitude = lon * 1e-7;
+
+                            uint16_t alt;
+                            memcpy(&alt, msg + 13, 2);
+                            rid.altitude = (alt * 0.5f) - 1000.0f;
+
+                            uint16_t spd;
+                            memcpy(&spd, msg + 15, 2);
+                            rid.speed = spd * 0.25f;
+
+                            uint16_t hdg;
+                            memcpy(&hdg, msg + 17, 2);
+                            rid.heading = hdg * 0.01f;
+
+                            rid.has_location = true;
                         }
                     }
                     msg_offset += 25;
                 }
 
-                // 只处理有 UAS ID 的报文
-                if (rid.has_basic) {
+                // ===== 每 10 秒最多打印一次 =====
+                static uint32_t last_print_time = 0;
+                uint32_t now = millis();
+                bool should_print = (now - last_print_time >= 10000);
+
+                if ((rid.has_basic || rid.has_location) && should_print) {
+                    last_print_time = now;
+
+                    Serial.println("========== RID ==========");
+                    Serial.printf("MAC       : %s\n", rid.mac);
+                    Serial.printf("RSSI      : %d dBm\n", rid.rssi);
+                    if (rid.has_basic) {
+                        Serial.printf("UAS ID    : %s\n", rid.uas_id);
+                        Serial.printf("ID Type   : %d\n", rid.id_type);
+                        Serial.printf("UA Type   : %d (%s)\n", rid.ua_type, ua_type_to_string(rid.ua_type));
+                    }
+                    if (rid.has_location) {
+                        Serial.printf("Latitude  : %.7f\n", rid.latitude);
+                        Serial.printf("Longitude : %.7f\n", rid.longitude);
+                        Serial.printf("Altitude  : %.1f m\n", rid.altitude);
+                        Serial.printf("Speed     : %.2f m/s\n", rid.speed);
+                        Serial.printf("Heading   : %.1f deg\n", rid.heading);
+                        Serial.printf("Status    : %d\n", rid.op_status);
+                    }
+
+                    Serial.printf("RAW Len   : %d\n", ie_len);
+                    Serial.print("RAW Data  : ");
+                    for (int i = 0; i < ie_len; i++) {
+                        Serial.printf("%02X ", d[i]);
+                        if ((i + 1) % 16 == 0) {
+                            Serial.print("\n            ");
+                        }
+                    }
+                    Serial.println();
+                    Serial.println("==========================");
+                }
+
+                // 入队（显示逻辑不受打印频率影响）
+                if (rid_queue != NULL && (rid.has_basic || rid.has_location)) {
                     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
                     xQueueSendFromISR(rid_queue, &rid, &xHigherPriorityTaskWoken);
                     if (xHigherPriorityTaskWoken) {
@@ -117,7 +212,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// ====== LVGL 定时器：从队列取 UAS ID 并更新界面 ======
+// ====== LVGL 定时器：只显示 UAS ID ======
 void update_rid_display(lv_timer_t * timer) {
     if (rid_queue == NULL || log_container == NULL) {
         return;
@@ -128,9 +223,13 @@ void update_rid_display(lv_timer_t * timer) {
 
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
         // 只显示 UAS ID，不截断
+        if (!rid.has_basic || rid.uas_id[0] == '\0') {
+            continue;
+        }
+
         const char *display_str = rid.uas_id;
 
-        // 去重：检查当前 10 个 Label 中是否已有相同内容
+        // 去重
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
             if (log_labels[i] == NULL) continue;
@@ -185,6 +284,7 @@ void log_init(void) {
 void setup() {
     Serial.begin(115200);
     delay(500);
+  
     Serial.println("\n===== BOOT =====");
 
     // ===== 阶段 1：RLCD 硬件初始化 =====
