@@ -25,11 +25,19 @@ static lv_obj_t * bat_label = NULL;
 // ====== 启动画面 ======
 static lv_obj_t * splash_label = NULL;
 
-// ====== 日志/列表显示相关 ======
+// ====== 左侧：UAS ID 列表 ======
 #define MAX_LINES 10
 static lv_obj_t * log_container = NULL;
 static lv_obj_t * log_labels[MAX_LINES];
 static int log_write_index = 0;
+
+// ====== 右侧：最新无人机详情 ======
+static lv_obj_t * detail_container = NULL;
+static lv_obj_t * detail_labels[10];
+static const char *detail_titles[10] = {
+    "ID:", "MAC:", "RSSI:", "UA Type:", "ID Type:",
+    "Lat:", "Lon:", "Alt:", "Spd:", "Stat:"
+};
 
 // ====== RID 数据结构 ======
 struct RIDData {
@@ -135,7 +143,6 @@ void bat_update_timer(lv_timer_t * timer) {
     int data;
     float vol = Adc_GetBatteryVoltage(&data);
 
-    // 变化小于 0.05V 时不刷新，避免无意义重绘
     static float last_vol = 0;
     if (fabs(vol - last_vol) < 0.05f) return;
     last_vol = vol;
@@ -151,6 +158,89 @@ void splash_init(void) {
     lv_obj_set_style_text_font(splash_label, &lv_font_montserrat_16, 0);
     lv_label_set_text(splash_label, "DRONE SCANNER");
     lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
+}
+
+// ====== 左侧列表初始化（保持原字体和间距） ======
+void log_init(void) {
+    log_container = lv_obj_create(lv_scr_act());
+    if (log_container == NULL) return;
+    lv_obj_set_size(log_container, 199, 299);
+    lv_obj_align(log_container, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_flex_flow(log_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(log_container, LV_SCROLLBAR_MODE_AUTO);
+
+    for (int i = 0; i < MAX_LINES; i++) {
+        log_labels[i] = lv_label_create(log_container);
+        lv_obj_set_width(log_labels[i], 190);
+        lv_label_set_long_mode(log_labels[i], LV_LABEL_LONG_WRAP);
+        lv_label_set_text(log_labels[i], "");
+    }
+    log_write_index = 0;
+}
+
+// ====== 右侧详情初始化（小字号 + 压缩行间距） ======
+void detail_init(void) {
+    detail_container = lv_obj_create(lv_scr_act());
+    if (detail_container == NULL) return;
+    lv_obj_set_size(detail_container, 200, 270);
+    lv_obj_align(detail_container, LV_ALIGN_TOP_RIGHT, 0, 20);
+    lv_obj_set_flex_flow(detail_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(detail_container, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_set_style_pad_row(detail_container, 2, 0);
+    lv_obj_set_style_pad_all(detail_container, 4, 0);
+
+    for (int i = 0; i < 10; i++) {
+        detail_labels[i] = lv_label_create(detail_container);
+        lv_obj_set_width(detail_labels[i], 190);
+        lv_label_set_long_mode(detail_labels[i], LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(detail_labels[i], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_pad_all(detail_labels[i], 0, 0);
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s --", detail_titles[i]);
+        lv_label_set_text(detail_labels[i], buf);
+    }
+
+    // 启动时隐藏右侧详情，避免遮挡 splash
+    lv_obj_add_flag(detail_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ====== 更新右侧详情 ======
+void detail_update(RIDData *rid) {
+    if (detail_container == NULL) return;
+
+    char buf[64];
+
+    snprintf(buf, sizeof(buf), "ID: %s", rid->uas_id[0] ? rid->uas_id : "--");
+    lv_label_set_text(detail_labels[0], buf);
+
+    snprintf(buf, sizeof(buf), "MAC: %s", rid->mac);
+    lv_label_set_text(detail_labels[1], buf);
+
+    snprintf(buf, sizeof(buf), "RSSI: %d dBm", rid->rssi);
+    lv_label_set_text(detail_labels[2], buf);
+
+    snprintf(buf, sizeof(buf), "UA Type: %s", ua_type_to_string(rid->ua_type));
+    lv_label_set_text(detail_labels[3], buf);
+
+    snprintf(buf, sizeof(buf), "ID Type: %d", rid->id_type);
+    lv_label_set_text(detail_labels[4], buf);
+
+    snprintf(buf, sizeof(buf), "Lat: %.5f", rid->latitude);
+    lv_label_set_text(detail_labels[5], buf);
+
+    snprintf(buf, sizeof(buf), "Lon: %.5f", rid->longitude);
+    lv_label_set_text(detail_labels[6], buf);
+
+    snprintf(buf, sizeof(buf), "Alt: %.1f m", rid->altitude);
+    lv_label_set_text(detail_labels[7], buf);
+
+    snprintf(buf, sizeof(buf), "Spd: %.2f m/s", rid->speed);
+    lv_label_set_text(detail_labels[8], buf);
+
+    snprintf(buf, sizeof(buf), "Stat: %d", rid->op_status);
+    lv_label_set_text(detail_labels[9], buf);
 }
 
 // ====== Wi-Fi 混杂模式回调 ======
@@ -282,7 +372,7 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
-// ====== LVGL 定时器：只显示 UAS ID（3 秒一次） ======
+// ====== LVGL 定时器：左侧列表 + 右侧详情 ======
 void update_rid_display(lv_timer_t * timer) {
     if (rid_queue == NULL || log_container == NULL) return;
 
@@ -292,14 +382,21 @@ void update_rid_display(lv_timer_t * timer) {
     while (xQueueReceive(rid_queue, &rid, 0) == pdTRUE && processed < 3) {
         if (!rid.has_basic || rid.uas_id[0] == '\0') continue;
 
-        // 收到第一条有效 RID，移除启动画面
+        // 收到第一条有效 RID，移除启动画面，显示右侧详情
         if (splash_label != NULL) {
             lv_obj_del(splash_label);
             splash_label = NULL;
+
+            if (detail_container != NULL) {
+                lv_obj_clear_flag(detail_container, LV_OBJ_FLAG_HIDDEN);
+            }
         }
 
-        const char *display_str = rid.uas_id;
+        // 更新右侧详情（始终显示最新一条）
+        detail_update(&rid);
 
+        // 左侧列表去重
+        const char *display_str = rid.uas_id;
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
             if (log_labels[i] == NULL) continue;
@@ -321,27 +418,8 @@ void update_rid_display(lv_timer_t * timer) {
     }
 }
 
-// ====== 日志列表初始化 ======
-void log_init(void) {
-    log_container = lv_obj_create(lv_scr_act());
-    if (log_container == NULL) return;
-    lv_obj_set_size(log_container, 390, 290);
-    lv_obj_align(log_container, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_flex_flow(log_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollbar_mode(log_container, LV_SCROLLBAR_MODE_AUTO);
-
-    for (int i = 0; i < MAX_LINES; i++) {
-        log_labels[i] = lv_label_create(log_container);
-        lv_obj_set_width(log_labels[i], 380);
-        lv_label_set_long_mode(log_labels[i], LV_LABEL_LONG_WRAP);
-        lv_label_set_text(log_labels[i], "");
-    }
-    log_write_index = 0;
-}
-
 // ====== 初始化 ======
 void setup() {
-    // 降低 CPU 主频到 80MHz
     setCpuFrequencyMhz(80);
 
     Serial.begin(115200);
@@ -373,11 +451,10 @@ void setup() {
     if (Lvgl_lock(-1)) {
         lv_tick_set_cb(millis);
         log_init();
+        detail_init();
         bat_label_init();
         splash_init();
-        // LVGL 刷新周期改为 3 秒
         lv_timer_create(update_rid_display, 3000, NULL);
-        // 电池电压刷新周期改为 30 秒
         lv_timer_create(bat_update_timer, 30000, NULL);
         Lvgl_unlock();
     }
@@ -392,8 +469,6 @@ void setup() {
     esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
 
     Serial.println("Setup done");
-    beep_once();
-    beep_once();
     beep_once();
 }
 
