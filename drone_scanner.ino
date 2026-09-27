@@ -20,15 +20,22 @@ static lv_obj_t * log_container;
 static lv_obj_t * log_labels[MAX_LINES];
 static int log_write_index = 0;
 
+// ====== BLE 数据结构 ======
+// 通过队列传递的原始数据，避免在 BLE 回调中做字符串拼接
+struct BeaconData {
+    char address[18];   // MAC 地址，如 "AA:BB:CC:DD:EE:FF"
+    char name[32];      // 设备名称，可能为空
+    int rssi;           // 信号强度
+};
+
 // ====== FreeRTOS 通信 ======
-// 用于在 BLE 回调（任务上下文）和 LVGL 任务之间安全传递字符串
 static QueueHandle_t beacon_queue = NULL;
 
-// BLE 扫描相关
+// ====== BLE 扫描相关 ======
 BLEScan* pBLEScan;
 int scanTime = 3; // 扫描时间（秒）
 
-
+// ====== LVGL 刷屏回调 ======
 static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map) {
     uint16_t *buffer = (uint16_t *)color_map;
     for (int y = area->y1; y <= area->y2; y++) {
@@ -42,45 +49,53 @@ static void Lvgl_FlushCallback(lv_display_t *drv, const lv_area_t *area, uint8_t
     lv_display_flush_ready(drv);
 }
 
-
-// ====== LVGL 部分（保持不变，略作调整以支持队列输入） ======
-void generate_random_string(char * buffer, size_t max_len) {
-    // 此函数不再用于生成日志，但保留以防万一
-    const char charset[] = "0123456789";
-    size_t charset_size = sizeof(charset) - 1;
-    size_t len = 1;
-    for (size_t i = 0; i < len; i++) {
-        buffer[i] = charset[random(charset_size)];
-    }
-    buffer[len] = '\0';
-}
-
-// ====== 新增：在 BLE 回调中收集信标信息，放入队列 ======
+// ====== BLE 回调：只做最轻量的数据拷贝，不做字符串拼接 ======
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
+        BeaconData data;
+        memset(&data, 0, sizeof(data));
+
+        // 获取 MAC 地址
         String addrStr = advertisedDevice.getAddress().toString();
-        const char * address = addrStr.c_str();
-        int rssi = advertisedDevice.getRSSI();
+        strncpy(data.address, addrStr.c_str(), sizeof(data.address) - 1);
+        data.address[sizeof(data.address) - 1] = '\0';
 
-        char buffer[64];
-        snprintf(buffer, sizeof(buffer), "%s %d", address, rssi);
-
-        if (beacon_queue != NULL) {
-            xQueueSend(beacon_queue, buffer, 0);
+        // 获取设备名称（可能为空）
+        if (advertisedDevice.haveName()) {
+            String nameStr = advertisedDevice.getName();
+            strncpy(data.name, nameStr.c_str(), sizeof(data.name) - 1);
+            data.name[sizeof(data.name) - 1] = '\0';
         }
 
-        Serial.printf("Beacon: %s RSSI: %d\n", address, rssi);
+        // 获取信号强度
+        data.rssi = advertisedDevice.getRSSI();
+
+        // 入队（非阻塞，队列满则丢弃）
+        if (beacon_queue != NULL) {
+            xQueueSend(beacon_queue, &data, 0);
+        }
     }
 };
 
-
-// ====== 新增：从队列取出数据并更新 LVGL 列表 ======
-// 在 LVGL 定时器回调中调用，确保在 LVGL 任务上下文中执行
+// ====== LVGL 定时器：从队列取数据，拼接字符串并更新界面 ======
 void update_beacon_list_from_queue(lv_timer_t * timer) {
-    char buffer[64];
-    // 每次最多处理 3 条，避免单次 LVGL 任务负载过高
+    if (beacon_queue == NULL) {
+        return;
+    }
+
+    BeaconData data;
     int processed = 0;
-    while (xQueueReceive(beacon_queue, buffer, 0) == pdTRUE && processed < 3) {
+
+    // 每次最多处理 3 条，避免单次 LVGL 任务负载过高
+    while (xQueueReceive(beacon_queue, &data, 0) == pdTRUE && processed < 3) {
+        // 拼接显示字符串
+        char buffer[96];
+        if (data.name[0] != '\0') {
+            snprintf(buffer, sizeof(buffer), "%s %s %d", data.name, data.address, data.rssi);
+        } else {
+            snprintf(buffer, sizeof(buffer), "[NoName] %s %d", data.address, data.rssi);
+        }
+
         // 去重：检查当前 10 个 Label 中是否已有相同内容
         bool duplicate = false;
         for (int i = 0; i < MAX_LINES; i++) {
@@ -91,24 +106,22 @@ void update_beacon_list_from_queue(lv_timer_t * timer) {
             }
         }
         if (duplicate) {
-            Serial.print("Duplicate, skipped: ");
-            Serial.println(buffer);
             continue;
         }
-        
+
         // 写入当前索引的 Label（环形覆盖）
         lv_label_set_text(log_labels[log_write_index], buffer);
         log_write_index = (log_write_index + 1) % MAX_LINES;
         processed++;
     }
-    
-    // 有新数据时才滚动
+
+    // 有新数据时才滚动到底部
     if (processed > 0) {
         lv_obj_scroll_to_y(log_container, lv_obj_get_scroll_bottom(log_container), LV_ANIM_OFF);
     }
 }
 
-// ====== 初始化 ======
+// ====== 日志列表初始化：一次性创建 10 个 Label ======
 void log_init(void) {
     log_container = lv_obj_create(lv_scr_act());
     if (log_container == NULL) {
@@ -122,17 +135,44 @@ void log_init(void) {
 
     for (int i = 0; i < MAX_LINES; i++) {
         log_labels[i] = lv_label_create(log_container);
+        if (log_labels[i] == NULL) {
+            Serial.print("ERROR: log_labels[");
+            Serial.print(i);
+            Serial.println("] creation failed!");
+            return;
+        }
         lv_label_set_text(log_labels[i], "");
     }
     log_write_index = 0;
 }
 
-// 原有的 log_add 不再需要，因为列表更新改由队列驱动
+// ====== 初始化 ======
 void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // 1. 先初始化 BLE（内存大户）
+    RlcdPort.RLCD_Init();
+    Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
+
+    // 所有 LVGL 操作必须加锁
+    if (Lvgl_lock(-1)) {
+        lv_tick_set_cb(millis);
+        log_init();
+        lv_timer_create(update_beacon_list_from_queue, 200, NULL);
+        Lvgl_unlock();
+    }
+
+    Serial.println("LVGL init done");
+
+    // 队列创建（与 LVGL 无关，不需要锁）
+    beacon_queue = xQueueCreate(20, sizeof(BeaconData));
+    if (beacon_queue == NULL) {
+        Serial.println("ERROR: Failed to create beacon_queue!");
+    } else {
+        Serial.println("beacon_queue created OK");
+    }
+
+    // BLE 初始化
     Serial.println("Initializing BLE...");
     BLEDevice::init("");
     pBLEScan = BLEDevice::getScan();
@@ -141,36 +181,17 @@ void setup() {
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(99);
 
-    // 2. 再创建队列（确保内存充足）
-    beacon_queue = xQueueCreate(20, 64);
-    if (beacon_queue == NULL) {
-        Serial.println("ERROR: Failed to create beacon_queue!");
-    } else {
-        Serial.println("beacon_queue created OK");
-    }
-
-    // 3. 再初始化 LVGL 显示
-    RlcdPort.RLCD_Init();
-    Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
-    if (Lvgl_lock(-1)) {
-        Lvgl_unlock();
-    }
-    lv_tick_set_cb(millis);
-
-    log_init();
-    lv_timer_create(update_beacon_list_from_queue, 200, NULL);
-
+    Serial.printf("Free heap: %d\n", esp_get_free_heap_size());
     Serial.println("Setup done");
 }
 
-
 void loop() {
-    // 执行 BLE 扫描（此函数是阻塞的，会等待 scanTime 秒）
+    // 执行 BLE 扫描（阻塞 scanTime 秒）
     BLEScanResults *foundDevices = pBLEScan->start(scanTime, false);
     Serial.printf("Devices found: %d\n", foundDevices->getCount());
 
     pBLEScan->clearResults(); // 释放扫描结果内存
-    
+
     // 短暂延时后再次扫描
     delay(1000);
 }
