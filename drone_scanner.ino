@@ -1,6 +1,6 @@
 #include "display_bsp.h"
 #include "src/app_bsp/lvgl_bsp.h"
-#include "src/ui_src/generated/gui_guider.h"
+
 #include "i2c_bsp.h"
 #include "codec_bsp.h"
 
@@ -8,7 +8,6 @@
 #include "esp_wifi.h"
 #include <math.h>
 
-static lv_ui init_ui;
 DisplayPort RlcdPort(12, 11, 5, 40, 41, 400, 300);
 
 // ====== 音频（ES8311） ======

@@ -4,27 +4,27 @@
 #include <freertos/FreeRTOS.h>
 #include "codec_bsp.h"
 #include "i2c_bsp.h"
-#include "src/Music/canon.h"
+//#include "src/Music/canon.h"
 
 
-const uint8_t * music_pcm_start = canon_pcm;
+//const uint8_t * music_pcm_start = canon_pcm;
 
 
-void CodecPort::CodecPort_MusicTask(void *arg) {
-  CodecPort *codec = (CodecPort *)arg;
-  codec->CodecPort_SetSpeakerVol(80);
-  for (;;) {
-    size_t bytes_write = 0;
-    size_t bytes_sizt = canon_pcm_len;
-    uint8_t *data_ptr = (uint8_t *)music_pcm_start;
-    codec->CodecPort_SetInfo("es8311", 1, 24000, 2, 16);
-    do {
-      codec->CodecPort_PlayWrite(data_ptr, 256);
-      data_ptr += 256;
-      bytes_write += 256;
-    } while (bytes_write < bytes_sizt);
-  }
-}
+// void CodecPort::CodecPort_MusicTask(void *arg) {
+//   CodecPort *codec = (CodecPort *)arg;
+//   codec->CodecPort_SetSpeakerVol(80);
+//   for (;;) {
+//     size_t bytes_write = 0;
+//     size_t bytes_sizt = canon_pcm_len;
+//     uint8_t *data_ptr = (uint8_t *)music_pcm_start;
+//     codec->CodecPort_SetInfo("es8311", 1, 24000, 2, 16);
+//     do {
+//       codec->CodecPort_PlayWrite(data_ptr, 256);
+//       data_ptr += 256;
+//       bytes_write += 256;
+//     } while (bytes_write < bytes_sizt);
+//   }
+// }
 
 void CodecPort::CodecPort_EchoTask(void *arg) {
   CodecPort *codec = (CodecPort *)arg;
@@ -131,7 +131,7 @@ void CodecPort::CodecPort_CreateEchoTask(void) {
   xTaskCreate(CodecPort_EchoTask, "CodecPort_EchoTask", 4 * 1024, (void *)this, 2, NULL);
 }
 
-uint8_t *CodecPort::CodecPort_GetPcmData(uint32_t *len) {
-  *len = canon_pcm_len;
-  return (uint8_t *)music_pcm_start;
-}
+// uint8_t *CodecPort::CodecPort_GetPcmData(uint32_t *len) {
+//   *len = canon_pcm_len;
+//   return (uint8_t *)music_pcm_start;
+// }
