@@ -335,6 +335,9 @@ void setup() {
     esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
 
     Serial.println("Setup done");
+    beep_once();
+    beep_once();
+    beep_once();
 }
 
 void loop() {
